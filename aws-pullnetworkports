@@ -1,0 +1,79 @@
+import boto3
+import pandas as pd
+
+# Initialize EC2 client
+ec2 = boto3.client('ec2')
+
+# Get all EC2 instances
+instances = ec2.describe_instances()
+
+# Store all results here
+data = []
+
+# Iterate through all reservations and instances
+for reservation in instances['Reservations']:
+    for instance in reservation['Instances']:
+        instance_id = instance['InstanceId']
+        instance_name = None
+
+        # Get Name tag if exists
+        for tag in instance.get('Tags', []):
+            if tag['Key'] == 'Name':
+                instance_name = tag['Value']
+        
+        # Get security groups
+        for sg in instance['SecurityGroups']:
+            sg_id = sg['GroupId']
+            sg_name = sg['GroupName']
+
+            # Get security group rules
+            sg_details = ec2.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
+
+            # Inbound rules
+            for rule in sg_details.get('IpPermissions', []):
+                from_port = rule.get('FromPort', 'All')
+                to_port = rule.get('ToPort', 'All')
+                protocol = rule.get('IpProtocol', 'All')
+
+                sources = [ip.get('CidrIp', '') for ip in rule.get('IpRanges', [])] + \
+                          [ip.get('CidrIpv6', '') for ip in rule.get('Ipv6Ranges', [])] + \
+                          [group.get('GroupId', '') for group in rule.get('UserIdGroupPairs', [])]
+
+                for src in sources:
+                    data.append({
+                        'Instance ID': instance_id,
+                        'Instance Name': instance_name,
+                        'Security Group': sg_name,
+                        'Rule Type': 'Inbound',
+                        'Protocol': protocol,
+                        'From Port': from_port,
+                        'To Port': to_port,
+                        'Source/Destination': src
+                    })
+
+            # Outbound rules
+            for rule in sg_details.get('IpPermissionsEgress', []):
+                from_port = rule.get('FromPort', 'All')
+                to_port = rule.get('ToPort', 'All')
+                protocol = rule.get('IpProtocol', 'All')
+
+                destinations = [ip.get('CidrIp', '') for ip in rule.get('IpRanges', [])] + \
+                               [ip.get('CidrIpv6', '') for ip in rule.get('Ipv6Ranges', [])] + \
+                               [group.get('GroupId', '') for group in rule.get('UserIdGroupPairs', [])]
+
+                for dst in destinations:
+                    data.append({
+                        'Instance ID': instance_id,
+                        'Instance Name': instance_name,
+                        'Security Group': sg_name,
+                        'Rule Type': 'Outbound',
+                        'Protocol': protocol,
+                        'From Port': from_port,
+                        'To Port': to_port,
+                        'Source/Destination': dst
+                    })
+
+# Create DataFrame and export to Excel
+df = pd.DataFrame(data)
+df.to_excel("ec2_port_mappings.xlsx", index=False)
+print("Exported EC2 port mappings to ec2_port_mappings.xlsx")
