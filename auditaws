@@ -1,0 +1,419 @@
+import boto3
+import pandas as pd
+from docx import Document
+
+ec2 = boto3.client('ec2')
+iam = boto3.client('iam')
+config = boto3.client('config')
+
+
+# ---------------------- Data Collection ----------------------
+def fetch_network_data():
+    vpcs = ec2.describe_vpcs()['Vpcs']
+    subnets = ec2.describe_subnets()['Subnets']
+    sgs = ec2.describe_security_groups()['SecurityGroups']
+    eips = ec2.describe_addresses()['Addresses']
+    rtbs = ec2.describe_route_tables()['RouteTables']
+    nats = ec2.describe_nat_gateways()['NatGateways']
+    peerings = ec2.describe_vpc_peering_connections()['VpcPeeringConnections']
+
+    vpc_data = [{'VPC ID': v['VpcId'], 'CIDR': v['CidrBlock'], 'Is Default': v.get('IsDefault', False)} for v in vpcs]
+
+    subnet_data = [{
+        'Subnet ID': s['SubnetId'],
+        'VPC ID': s['VpcId'],
+        'CIDR': s['CidrBlock'],
+        'AZ': s['AvailabilityZone'],
+        'Public?': s['MapPublicIpOnLaunch']
+    } for s in subnets]
+
+    sg_data = []
+    for sg in sgs:
+        for rule in sg.get('IpPermissions', []):
+            from_port = rule.get('FromPort', 'All')
+            to_port = rule.get('ToPort', 'All')
+            proto = rule.get('IpProtocol', 'All')
+            for ip_range in rule.get('IpRanges', []):
+                sg_data.append({
+                    'SG ID': sg['GroupId'],
+                    'Name': sg['GroupName'],
+                    'Protocol': proto,
+                    'Port Range': f"{from_port}-{to_port}",
+                    'Source': ip_range.get('CidrIp', '')
+                })
+
+    eip_data = [{
+        'Public IP': e['PublicIp'],
+        'Private IP': e.get('PrivateIpAddress', ''),
+        'Instance ID': e.get('InstanceId', ''),
+        'Network Interface': e.get('NetworkInterfaceId', '')
+    } for e in eips]
+
+    rtb_data = []
+    for rtb in rtbs:
+        for assoc in rtb.get('Associations', []):
+            subnet_id = assoc.get('SubnetId', 'Main')
+            for route in rtb.get('Routes', []):
+                rtb_data.append({
+                    'Route Table ID': rtb['RouteTableId'],
+                    'Subnet Association': subnet_id,
+                    'Destination': route.get('DestinationCidrBlock', route.get('DestinationIpv6CidrBlock', '')),
+                    'Target': route.get('GatewayId', route.get('NatGatewayId', route.get('InstanceId', '')))
+                })
+
+    nat_data = [{
+        'NAT GW ID': n['NatGatewayId'],
+        'VPC ID': n['VpcId'],
+        'Subnet ID': n['SubnetId'],
+        'Public IP': next((addr['PublicIp'] for addr in n['NatGatewayAddresses'] if 'PublicIp' in addr), ''),
+        'State': n['State']
+    } for n in nats]
+
+    peering_data = [{
+        'Peering ID': p['VpcPeeringConnectionId'],
+        'Requester VPC': p['RequesterVpcInfo']['VpcId'],
+        'Accepter VPC': p['AccepterVpcInfo']['VpcId'],
+        'Status': p['Status']['Code']
+    } for p in peerings]
+
+    return vpc_data, subnet_data, sg_data, eip_data, rtb_data, nat_data, peering_data
+
+
+def fetch_iam_data():
+    users = iam.list_users()['Users']
+    iam_user_data = []
+    for user in users:
+        mfa_devices = iam.list_mfa_devices(UserName=user['UserName'])['MFADevices']
+        access_keys = iam.list_access_keys(UserName=user['UserName'])['AccessKeyMetadata']
+        for key in access_keys:
+            key_last_used = iam.get_access_key_last_used(AccessKeyId=key['AccessKeyId'])['AccessKeyLastUsed']
+            iam_user_data.append({
+                'User': user['UserName'],
+                'Access Key ID': key['AccessKeyId'],
+                'Status': key['Status'],
+                'Last Used': key_last_used.get('LastUsedDate', 'Never'),
+                'MFA Enabled': 'Yes' if mfa_devices else 'No'
+            })
+    roles = iam.list_roles()['Roles']
+    iam_roles = [{'Role Name': r['RoleName'], 'Creation Date': r['CreateDate']} for r in roles]
+    return iam_user_data, iam_roles
+
+
+def fetch_config_compliance():
+    try:
+        rules = config.describe_config_rules()['ConfigRules']
+        compliance_data = []
+        for rule in rules:
+            results = config.get_compliance_details_by_config_rule(ConfigRuleName=rule['ConfigRuleName'])
+            for eval in results['EvaluationResults']:
+                compliance_data.append({
+                    'Rule': rule['ConfigRuleName'],
+                    'Compliance Type': eval['ComplianceType'],
+                    'Evaluated At': eval['ResultRecordedTime'].strftime('%Y-%m-%d %H:%M:%S')
+                })
+        return compliance_data
+    except Exception as e:
+        return [{'Error': f"AWS Config not enabled or accessible: {str(e)}"}]
+
+
+def fetch_public_ip_alerts(eips, subnets):
+    alerts = []
+    for eip in eips:
+        if not eip.get('InstanceId') and not eip.get('NetworkInterfaceId'):
+            alerts.append({'EIP': eip['PublicIp'], 'Issue': 'Unused Elastic IP (incurs cost)'})
+    for sn in subnets:
+        if sn.get('MapPublicIpOnLaunch'):
+            alerts.append({'Subnet': sn['SubnetId'], 'Issue': 'Instances launched here get public IPs'})
+    return alerts
+
+
+# ---------------------- Export Functions ----------------------
+
+def write_table(doc, title, data):
+    doc.add_heading(title, level=2)
+    if not data:
+        doc.add_paragraph("No data found.")
+        return
+    keys = list(data[0].keys())
+    table = doc.add_table(rows=1, cols=len(keys))
+    table.style = 'Table Grid'
+    for i, key in enumerate(keys):
+        table.cell(0, i).text = key
+    for row in data:
+        cells = table.add_row().cells
+        for i, key in enumerate(keys):
+            cells[i].text = str(row[key])
+
+
+def export_to_excel(data_dict, filename='aws_audit_extended.xlsx'):
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        for sheet_name, content in data_dict.items():
+            pd.DataFrame(content).to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def export_to_word(data_dict, filename='aws_audit_extended.docx'):
+    doc = Document()
+    doc.add_heading('AWS Network & Security Audit Report', 0)
+    for title, content in data_dict.items():
+        write_table(doc, title, content)
+    doc.save(filename)
+
+
+# ---------------------- Main Script ----------------------
+
+def main():
+    vpcs, subnets, sgs, eips, rtbs, nats, peerings = fetch_network_data()
+    iam_users, iam_roles = fetch_iam_data()
+    config_compliance = fetch_config_compliance()
+    ip_alerts = fetch_public_ip_alerts(eips, subnets)
+
+    all_data = {
+        'VPCs': vpcs,
+        'Subnets': subnets,
+        'SecurityGroups': sgs,
+        'ElasticIPs': eips,
+        'RouteTables': rtbs,
+        'NATGateways': nats,
+        'VPCPeerings': peerings,
+        'IAM_Users': iam_users,
+        'IAM_Roles': iam_roles,
+        'AWS_Config': config_compliance,
+        'IP_Alerts': ip_alerts
+    }
+
+    export_to_excel(all_data)
+    export_to_word(all_data)
+
+    print("✅ Export complete: aws_audit_extended.xlsx and aws_audit_extended.docx")
+
+
+if __name__ == '__main__':
+    main()
+    
+    vBelow is the complete Python script that audits your AWS environment for:
+
+VPCs, Subnets, Security Groups, Route Tables
+
+Elastic IPs, NAT Gateways, VPC Peering
+
+IAM Users, Access Keys, MFA, IAM Roles
+
+AWS Config compliance rules
+
+Cost-related Public IP usage alerts
+
+Exports to both Excel (.xlsx) and Word (.docx) format
+
+
+
+---
+
+✅ Prerequisites
+
+Install required libraries:
+
+pip install boto3 pandas python-docx openpyxl
+
+Ensure AWS credentials are set up via:
+
+aws configure
+
+
+---
+
+🐍 Full Script: aws_network_audit_extended.py
+
+import boto3
+import pandas as pd
+from docx import Document
+
+ec2 = boto3.client('ec2')
+iam = boto3.client('iam')
+config = boto3.client('config')
+
+
+# ---------------------- Data Collection ----------------------
+def fetch_network_data():
+    vpcs = ec2.describe_vpcs()['Vpcs']
+    subnets = ec2.describe_subnets()['Subnets']
+    sgs = ec2.describe_security_groups()['SecurityGroups']
+    eips = ec2.describe_addresses()['Addresses']
+    rtbs = ec2.describe_route_tables()['RouteTables']
+    nats = ec2.describe_nat_gateways()['NatGateways']
+    peerings = ec2.describe_vpc_peering_connections()['VpcPeeringConnections']
+
+    vpc_data = [{'VPC ID': v['VpcId'], 'CIDR': v['CidrBlock'], 'Is Default': v.get('IsDefault', False)} for v in vpcs]
+
+    subnet_data = [{
+        'Subnet ID': s['SubnetId'],
+        'VPC ID': s['VpcId'],
+        'CIDR': s['CidrBlock'],
+        'AZ': s['AvailabilityZone'],
+        'Public?': s['MapPublicIpOnLaunch']
+    } for s in subnets]
+
+    sg_data = []
+    for sg in sgs:
+        for rule in sg.get('IpPermissions', []):
+            from_port = rule.get('FromPort', 'All')
+            to_port = rule.get('ToPort', 'All')
+            proto = rule.get('IpProtocol', 'All')
+            for ip_range in rule.get('IpRanges', []):
+                sg_data.append({
+                    'SG ID': sg['GroupId'],
+                    'Name': sg['GroupName'],
+                    'Protocol': proto,
+                    'Port Range': f"{from_port}-{to_port}",
+                    'Source': ip_range.get('CidrIp', '')
+                })
+
+    eip_data = [{
+        'Public IP': e['PublicIp'],
+        'Private IP': e.get('PrivateIpAddress', ''),
+        'Instance ID': e.get('InstanceId', ''),
+        'Network Interface': e.get('NetworkInterfaceId', '')
+    } for e in eips]
+
+    rtb_data = []
+    for rtb in rtbs:
+        for assoc in rtb.get('Associations', []):
+            subnet_id = assoc.get('SubnetId', 'Main')
+            for route in rtb.get('Routes', []):
+                rtb_data.append({
+                    'Route Table ID': rtb['RouteTableId'],
+                    'Subnet Association': subnet_id,
+                    'Destination': route.get('DestinationCidrBlock', route.get('DestinationIpv6CidrBlock', '')),
+                    'Target': route.get('GatewayId', route.get('NatGatewayId', route.get('InstanceId', '')))
+                })
+
+    nat_data = [{
+        'NAT GW ID': n['NatGatewayId'],
+        'VPC ID': n['VpcId'],
+        'Subnet ID': n['SubnetId'],
+        'Public IP': next((addr['PublicIp'] for addr in n['NatGatewayAddresses'] if 'PublicIp' in addr), ''),
+        'State': n['State']
+    } for n in nats]
+
+    peering_data = [{
+        'Peering ID': p['VpcPeeringConnectionId'],
+        'Requester VPC': p['RequesterVpcInfo']['VpcId'],
+        'Accepter VPC': p['AccepterVpcInfo']['VpcId'],
+        'Status': p['Status']['Code']
+    } for p in peerings]
+
+    return vpc_data, subnet_data, sg_data, eip_data, rtb_data, nat_data, peering_data
+
+
+def fetch_iam_data():
+    users = iam.list_users()['Users']
+    iam_user_data = []
+    for user in users:
+        mfa_devices = iam.list_mfa_devices(UserName=user['UserName'])['MFADevices']
+        access_keys = iam.list_access_keys(UserName=user['UserName'])['AccessKeyMetadata']
+        for key in access_keys:
+            key_last_used = iam.get_access_key_last_used(AccessKeyId=key['AccessKeyId'])['AccessKeyLastUsed']
+            iam_user_data.append({
+                'User': user['UserName'],
+                'Access Key ID': key['AccessKeyId'],
+                'Status': key['Status'],
+                'Last Used': key_last_used.get('LastUsedDate', 'Never'),
+                'MFA Enabled': 'Yes' if mfa_devices else 'No'
+            })
+    roles = iam.list_roles()['Roles']
+    iam_roles = [{'Role Name': r['RoleName'], 'Creation Date': r['CreateDate']} for r in roles]
+    return iam_user_data, iam_roles
+
+
+def fetch_config_compliance():
+    try:
+        rules = config.describe_config_rules()['ConfigRules']
+        compliance_data = []
+        for rule in rules:
+            results = config.get_compliance_details_by_config_rule(ConfigRuleName=rule['ConfigRuleName'])
+            for eval in results['EvaluationResults']:
+                compliance_data.append({
+                    'Rule': rule['ConfigRuleName'],
+                    'Compliance Type': eval['ComplianceType'],
+                    'Evaluated At': eval['ResultRecordedTime'].strftime('%Y-%m-%d %H:%M:%S')
+                })
+        return compliance_data
+    except Exception as e:
+        return [{'Error': f"AWS Config not enabled or accessible: {str(e)}"}]
+
+
+def fetch_public_ip_alerts(eips, subnets):
+    alerts = []
+    for eip in eips:
+        if not eip.get('InstanceId') and not eip.get('NetworkInterfaceId'):
+            alerts.append({'EIP': eip['PublicIp'], 'Issue': 'Unused Elastic IP (incurs cost)'})
+    for sn in subnets:
+        if sn.get('MapPublicIpOnLaunch'):
+            alerts.append({'Subnet': sn['SubnetId'], 'Issue': 'Instances launched here get public IPs'})
+    return alerts
+
+
+# ---------------------- Export Functions ----------------------
+
+def write_table(doc, title, data):
+    doc.add_heading(title, level=2)
+    if not data:
+        doc.add_paragraph("No data found.")
+        return
+    keys = list(data[0].keys())
+    table = doc.add_table(rows=1, cols=len(keys))
+    table.style = 'Table Grid'
+    for i, key in enumerate(keys):
+        table.cell(0, i).text = key
+    for row in data:
+        cells = table.add_row().cells
+        for i, key in enumerate(keys):
+            cells[i].text = str(row[key])
+
+
+def export_to_excel(data_dict, filename='aws_audit_extended.xlsx'):
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        for sheet_name, content in data_dict.items():
+            pd.DataFrame(content).to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def export_to_word(data_dict, filename='aws_audit_extended.docx'):
+    doc = Document()
+    doc.add_heading('AWS Network & Security Audit Report', 0)
+    for title, content in data_dict.items():
+        write_table(doc, title, content)
+    doc.save(filename)
+
+
+# ---------------------- Main Script ----------------------
+
+def main():
+    vpcs, subnets, sgs, eips, rtbs, nats, peerings = fetch_network_data()
+    iam_users, iam_roles = fetch_iam_data()
+    config_compliance = fetch_config_compliance()
+    ip_alerts = fetch_public_ip_alerts(eips, subnets)
+
+    all_data = {
+        'VPCs': vpcs,
+        'Subnets': subnets,
+        'SecurityGroups': sgs,
+        'ElasticIPs': eips,
+        'RouteTables': rtbs,
+        'NATGateways': nats,
+        'VPCPeerings': peerings,
+        'IAM_Users': iam_users,
+        'IAM_Roles': iam_roles,
+        'AWS_Config': config_compliance,
+        'IP_Alerts': ip_alerts
+    }
+
+    export_to_excel(all_data)
+    export_to_word(all_data)
+
+    print("✅ Export complete: aws_audit_extended.xlsx and aws_audit_extended.docx")
+
+
+if __name__ == '__main__':
+    main()
+
+
+pip install boto3 pandas python-docx openpyxl
