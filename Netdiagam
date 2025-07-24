@@ -1,128 +1,81 @@
 import boto3
-from diagrams import Diagram, Cluster
-from diagrams.aws.compute import EC2
-from diagrams.aws.network import VPC, PublicSubnet, PrivateSubnet, InternetGateway, NATGateway, ELB, RouteTable
-from diagrams.aws.database import RDS
-from diagrams.aws.security import SecurityGroup
-from openpyxl import Workbook
+from graphviz import Digraph
 
-# AWS session
+# Initialize AWS clients
 session = boto3.Session(profile_name='default', region_name='us-east-1')
 ec2 = session.client('ec2')
 rds = session.client('rds')
-elb = session.client('elbv2')
 
-# Get data
+# Fetch AWS data
 vpcs = ec2.describe_vpcs()['Vpcs']
 subnets = ec2.describe_subnets()['Subnets']
 instances = ec2.describe_instances()['Reservations']
-sgs = ec2.describe_security_groups()['SecurityGroups']
-nat_gateways = ec2.describe_nat_gateways()['NatGateways']
-elbs = elb.describe_load_balancers()['LoadBalancers']
 rds_instances = rds.describe_db_instances()['DBInstances']
+nat_gateways = ec2.describe_nat_gateways()['NatGateways']
 route_tables = ec2.describe_route_tables()['RouteTables']
 
-# Build SG and subnet maps
-sg_map = {sg['GroupId']: sg['GroupName'] for sg in sgs}
-subnet_map = {s['SubnetId']: s for s in subnets}
+# Graph setup
+dot = Digraph('AWS_Topology', format='svg')
+dot.attr(rankdir='LR', size='10')
 
-# Excel workbook
-wb = Workbook()
-ws_ec2 = wb.create_sheet("EC2 Instances")
-ws_sg = wb.create_sheet("Security Groups")
-ws_subnet = wb.create_sheet("Subnets")
-ws_rds = wb.create_sheet("RDS")
-ws_elb = wb.create_sheet("ELBs")
-ws_nat = wb.create_sheet("NAT Gateways")
-ws_routes = wb.create_sheet("Route Tables")
+# Colors
+colors = {
+    'vpc': 'lightblue',
+    'subnet': 'lightgrey',
+    'ec2': 'orange',
+    'rds': 'green',
+    'nat': 'pink',
+    'route_table': 'yellow'
+}
 
-# Write headers
-ws_ec2.append(["InstanceId", "SubnetId", "VPC", "SecurityGroups"])
-ws_sg.append(["GroupId", "GroupName", "Description"])
-ws_subnet.append(["SubnetId", "CIDR", "VPC", "AZ"])
-ws_rds.append(["DB Identifier", "Engine", "VPC"])
-ws_elb.append(["ELB Name", "DNS Name", "VPC", "Type"])
-ws_nat.append(["NAT Gateway ID", "SubnetId", "VPC"])
-ws_routes.append(["Route Table ID", "VPC", "Associated Subnets"])
+# Helper: Add node with color
+def add_node(id, label, type_):
+    dot.node(id, label=label, style='filled', fillcolor=colors.get(type_, 'white'))
 
-# Diagram
-with Diagram("AWS Network with Route Tables", filename="aws_network_diagram", outformat="svg", show=True):
-    for vpc in vpcs:
-        vpc_id = vpc['VpcId']
-        with Cluster(f"VPC: {vpc_id}"):
-            igw = InternetGateway("IGW")
-            subnet_nodes = {}
+# Build VPCs
+for vpc in vpcs:
+    vpc_id = vpc['VpcId']
+    add_node(vpc_id, f"VPC\n{vpc_id}", 'vpc')
 
-            for subnet in filter(lambda x: x['VpcId'] == vpc_id, subnets):
-                subnet_id = subnet['SubnetId']
-                is_public = subnet.get('MapPublicIpOnLaunch', False)
-                subnet_name = f"{subnet_id} ({'Public' if is_public else 'Private'})"
-                node = PublicSubnet(subnet_name) if is_public else PrivateSubnet(subnet_name)
-                subnet_nodes[subnet_id] = node
-                ws_subnet.append([subnet_id, subnet['CidrBlock'], vpc_id, subnet['AvailabilityZone']])
+    # Subnets in this VPC
+    for subnet in filter(lambda x: x['VpcId'] == vpc_id, subnets):
+        subnet_id = subnet['SubnetId']
+        az = subnet['AvailabilityZone']
+        add_node(subnet_id, f"Subnet\n{subnet_id}\n{az}", 'subnet')
+        dot.edge(vpc_id, subnet_id)
 
-            # Route Tables
-            for rt in route_tables:
-                if rt['VpcId'] != vpc_id:
-                    continue
-                rt_id = rt['RouteTableId']
-                rt_node = RouteTable(rt_id)
-                associated_subnets = []
-                for assoc in rt.get('Associations', []):
-                    subnet_id = assoc.get('SubnetId')
-                    if subnet_id and subnet_id in subnet_nodes:
-                        subnet_nodes[subnet_id] >> rt_node
-                        associated_subnets.append(subnet_id)
-                ws_routes.append([rt_id, vpc_id, ", ".join(associated_subnets)])
-
-            # NAT Gateway
-            for nat in filter(lambda x: x['VpcId'] == vpc_id, nat_gateways):
-                nat_id = nat['NatGatewayId']
-                nat_node = NATGateway(nat_id)
-                ws_nat.append([nat_id, nat['SubnetId'], nat['VpcId']])
-                if nat['SubnetId'] in subnet_nodes:
-                    subnet_nodes[nat['SubnetId']] >> nat_node
-
-            # ELBs
-            for lb in filter(lambda x: x['VpcId'] == vpc_id, elbs):
-                lb_node = ELB(lb['LoadBalancerName'])
-                ws_elb.append([lb['LoadBalancerName'], lb['DNSName'], lb['VpcId'], lb['Type']])
-                for az in lb['AvailabilityZones']:
-                    sid = az['SubnetId']
-                    if sid in subnet_nodes:
-                        subnet_nodes[sid] >> lb_node
-
-            # RDS
-            for db in rds_instances:
-                if db['DBSubnetGroup']['VpcId'] != vpc_id:
-                    continue
-                rds_node = RDS(db['DBInstanceIdentifier'])
-                ws_rds.append([db['DBInstanceIdentifier'], db['Engine'], vpc_id])
-                for subnet in db['DBSubnetGroup']['Subnets']:
-                    sid = subnet['SubnetIdentifier']
-                    if sid in subnet_nodes:
-                        subnet_nodes[sid] >> rds_node
-
-            # EC2
-            for res in instances:
-                for inst in res['Instances']:
-                    if inst['VpcId'] != vpc_id:
-                        continue
+        # EC2 Instances in subnet
+        for res in instances:
+            for inst in res['Instances']:
+                if inst['SubnetId'] == subnet_id:
                     inst_id = inst['InstanceId']
-                    subnet_id = inst.get('SubnetId')
-                    node = EC2(inst_id)
-                    if subnet_id in subnet_nodes:
-                        subnet_nodes[subnet_id] >> node
+                    add_node(inst_id, f"EC2\n{inst_id}", 'ec2')
+                    dot.edge(subnet_id, inst_id)
 
-                    sg_names = [sg_map.get(sg['GroupId'], sg['GroupId']) for sg in inst.get('SecurityGroups', [])]
-                    ws_ec2.append([inst_id, subnet_id, vpc_id, ", ".join(sg_names)])
+        # NAT Gateways
+        for nat in nat_gateways:
+            if nat['SubnetId'] == subnet_id:
+                nat_id = nat['NatGatewayId']
+                add_node(nat_id, f"NAT\n{nat_id}", 'nat')
+                dot.edge(subnet_id, nat_id)
 
-# Security Groups
-for sg in sgs:
-    ws_sg.append([sg['GroupId'], sg['GroupName'], sg['Description']])
+    # RDS in VPC
+    for db in rds_instances:
+        if db['DBSubnetGroup']['VpcId'] == vpc_id:
+            db_id = db['DBInstanceIdentifier']
+            add_node(db_id, f"RDS\n{db_id}", 'rds')
+            for subnet in db['DBSubnetGroup']['Subnets']:
+                dot.edge(subnet['SubnetIdentifier'], db_id)
 
-# Save Excel
-wb.remove(wb['Sheet'])  # remove default
-wb.save("aws_network_inventory.xlsx")
-print("✅ Diagram saved as aws_network_diagram.svg")
-print("✅ Excel saved as aws_network_inventory.xlsx")
+    # Route Tables
+    for rt in filter(lambda x: x['VpcId'] == vpc_id, route_tables):
+        rt_id = rt['RouteTableId']
+        add_node(rt_id, f"RouteTable\n{rt_id}", 'route_table')
+        for assoc in rt.get('Associations', []):
+            subnet_id = assoc.get('SubnetId')
+            if subnet_id:
+                dot.edge(rt_id, subnet_id)
+
+# Save to SVG
+dot.render(filename='aws_topology_graph', cleanup=True)
+print("✅ Diagram saved as aws_topology_graph.svg")
