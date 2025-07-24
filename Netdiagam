@@ -1,81 +1,112 @@
 import boto3
-from graphviz import Digraph
+import json
+import csv
+import ipaddress
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
 
-# Initialize AWS clients
-session = boto3.Session(profile_name='default', region_name='us-east-1')
-ec2 = session.client('ec2')
-rds = session.client('rds')
+REGION = "ap-southeast-2"
 
-# Fetch AWS data
-vpcs = ec2.describe_vpcs()['Vpcs']
-subnets = ec2.describe_subnets()['Subnets']
-instances = ec2.describe_instances()['Reservations']
-rds_instances = rds.describe_db_instances()['DBInstances']
-nat_gateways = ec2.describe_nat_gateways()['NatGateways']
-route_tables = ec2.describe_route_tables()['RouteTables']
+# AWS Clients
+ec2 = boto3.client('ec2', region_name=REGION)
+logs = boto3.client('logs', region_name=REGION)
 
-# Graph setup
-dot = Digraph('AWS_Topology', format='svg')
-dot.attr(rankdir='LR', size='10')
+def classify_ip(ip):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return 'External' if ip_obj.is_global else 'Internal'
+    except ValueError:
+        return 'Unknown'
 
-# Colors
-colors = {
-    'vpc': 'lightblue',
-    'subnet': 'lightgrey',
-    'ec2': 'orange',
-    'rds': 'green',
-    'nat': 'pink',
-    'route_table': 'yellow'
-}
+def get_instances():
+    instances = ec2.describe_instances()
+    data = []
+    for res in instances['Reservations']:
+        for inst in res['Instances']:
+            interfaces = [ni['NetworkInterfaceId'] for ni in inst.get('NetworkInterfaces', [])]
+            data.append({
+                'InstanceId': inst['InstanceId'],
+                'PrivateIP': inst.get('PrivateIpAddress'),
+                'PublicIP': inst.get('PublicIpAddress'),
+                'NetworkInterfaces': interfaces,
+                'SecurityGroups': [sg['GroupId'] for sg in inst['SecurityGroups']]
+            })
+    return data
 
-# Helper: Add node with color
-def add_node(id, label, type_):
-    dot.node(id, label=label, style='filled', fillcolor=colors.get(type_, 'white'))
+def get_flow_logs():
+    flow_logs = ec2.describe_flow_logs()
+    return flow_logs['FlowLogs']
 
-# Build VPCs
-for vpc in vpcs:
-    vpc_id = vpc['VpcId']
-    add_node(vpc_id, f"VPC\n{vpc_id}", 'vpc')
+def get_sample_flow_events(log_group):
+    streams = logs.describe_log_streams(logGroupName=log_group)['logStreams']
+    events = []
+    for stream in streams[:1]:  # Limit for example
+        log_events = logs.get_log_events(logGroupName=log_group, logStreamName=stream['logStreamName'], limit=50)
+        for event in log_events['events']:
+            events.append(event['message'])
+    return events
 
-    # Subnets in this VPC
-    for subnet in filter(lambda x: x['VpcId'] == vpc_id, subnets):
-        subnet_id = subnet['SubnetId']
-        az = subnet['AvailabilityZone']
-        add_node(subnet_id, f"Subnet\n{subnet_id}\n{az}", 'subnet')
-        dot.edge(vpc_id, subnet_id)
+def parse_flow_logs(flow_logs):
+    records = []
+    for flow in flow_logs:
+        log_group = flow['LogGroupName']
+        try:
+            events = get_sample_flow_events(log_group)
+            for message in events:
+                parts = message.split()
+                src_ip, dst_ip = parts[3], parts[4]
+                src_port, dst_port = parts[5], parts[6]
+                direction = 'Outbound' if classify_ip(dst_ip) == 'External' else 'Inbound'
+                records.append({
+                    'SourceIP': src_ip,
+                    'DestinationIP': dst_ip,
+                    'SourcePort': src_port,
+                    'DestinationPort': dst_port,
+                    'Direction': direction
+                })
+        except Exception as e:
+            print(f"Log group fetch failed: {log_group}, error: {e}")
+    return records
 
-        # EC2 Instances in subnet
-        for res in instances:
-            for inst in res['Instances']:
-                if inst['SubnetId'] == subnet_id:
-                    inst_id = inst['InstanceId']
-                    add_node(inst_id, f"EC2\n{inst_id}", 'ec2')
-                    dot.edge(subnet_id, inst_id)
+def export_csv(data, filename='aws_network_flows.csv'):
+    df = pd.DataFrame(data)
+    df.to_csv(filename, index=False)
+    print(f"✅ CSV export complete: {filename}")
 
-        # NAT Gateways
-        for nat in nat_gateways:
-            if nat['SubnetId'] == subnet_id:
-                nat_id = nat['NatGatewayId']
-                add_node(nat_id, f"NAT\n{nat_id}", 'nat')
-                dot.edge(subnet_id, nat_id)
+def generate_flow_map(data):
+    G = nx.DiGraph()
+    for record in data:
+        src = record['SourceIP']
+        dst = record['DestinationIP']
+        direction = record['Direction']
+        label = f"{record['SourcePort']}→{record['DestinationPort']}"
+        color = 'blue' if direction == 'Internal' else 'red'
+        G.add_edge(src, dst, label=label, color=color)
 
-    # RDS in VPC
-    for db in rds_instances:
-        if db['DBSubnetGroup']['VpcId'] == vpc_id:
-            db_id = db['DBInstanceIdentifier']
-            add_node(db_id, f"RDS\n{db_id}", 'rds')
-            for subnet in db['DBSubnetGroup']['Subnets']:
-                dot.edge(subnet['SubnetIdentifier'], db_id)
+    pos = nx.spring_layout(G, seed=42)
+    edges = G.edges()
+    colors = [G[u][v]['color'] for u,v in edges]
+    labels = nx.get_edge_attributes(G, 'label')
 
-    # Route Tables
-    for rt in filter(lambda x: x['VpcId'] == vpc_id, route_tables):
-        rt_id = rt['RouteTableId']
-        add_node(rt_id, f"RouteTable\n{rt_id}", 'route_table')
-        for assoc in rt.get('Associations', []):
-            subnet_id = assoc.get('SubnetId')
-            if subnet_id:
-                dot.edge(rt_id, subnet_id)
+    plt.figure(figsize=(12, 8))
+    nx.draw(G, pos, edges=edges, edge_color=colors, with_labels=True, node_color='lightgray', node_size=800)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, font_size=8)
+    plt.title("AWS Network Flow Map")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig("aws_network_flow_map.png")
+    plt.show()
+    print("🗺️ Visual flow map saved: aws_network_flow_map.png")
 
-# Save to SVG
-dot.render(filename='aws_topology_graph', cleanup=True)
-print("✅ Diagram saved as aws_topology_graph.svg")
+def main():
+    print("🔍 Collecting AWS Network Info...")
+    instances = get_instances()
+    flows = get_flow_logs()
+    flow_data = parse_flow_logs(flows)
+
+    export_csv(flow_data)
+    generate_flow_map(flow_data)
+
+if __name__ == "__main__":
+    main()
