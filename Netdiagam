@@ -28,6 +28,7 @@ def classify_ip(ip):
 
 
 def get_instances():
+    print("📡 Fetching EC2 instances...")
     instances = ec2.describe_instances()
     data = []
     for res in instances['Reservations']:
@@ -54,14 +55,24 @@ def map_ip_to_instance(instances):
 
 
 def get_flow_logs():
+    print("📥 Retrieving VPC Flow Log configurations...")
     flow_logs = ec2.describe_flow_logs()
     return flow_logs['FlowLogs']
 
 
 def get_sample_flow_events(log_group, max_streams=2, max_events=100):
     events = []
+
+    # Check if log group exists
     try:
-        streams = logs.describe_log_streams(logGroupName=log_group)['logStreams']
+        logs.describe_log_groups(logGroupNamePrefix=log_group)
+    except logs.exceptions.ResourceNotFoundException:
+        print(f"⚠️ Log group not found: {log_group}")
+        return events
+
+    try:
+        streams_response = logs.describe_log_streams(logGroupName=log_group)
+        streams = streams_response.get('logStreams', [])
         for stream in streams[:max_streams]:
             attempts = 0
             while attempts < 3:
@@ -79,17 +90,24 @@ def get_sample_flow_events(log_group, max_streams=2, max_events=100):
                         attempts += 1
                         time.sleep(2 ** attempts)
                     else:
-                        raise e
+                        print(f"❌ Failed to fetch events from stream {stream['logStreamName']}: {e}")
+                        break
     except ClientError as e:
-        print(f"❌ Failed to get logs from {log_group}: {e}")
+        print(f"❌ Failed to get streams from {log_group}: {e}")
     return events
 
 
 def parse_flow_logs(flow_logs, ip_instance_map):
+    print("🔎 Parsing flow log events...")
     records = []
     for flow in flow_logs:
         log_group = flow['LogGroupName']
+        print(f"📦 Processing log group: {log_group}")
         events = get_sample_flow_events(log_group)
+        if not events:
+            print(f"⚠️ No events found or log group unavailable: {log_group}")
+            continue
+
         for message in events:
             parts = message.split()
             if len(parts) < 14:
@@ -129,6 +147,7 @@ def export_csv(data, filename='aws_network_flows.csv'):
 
 
 def generate_flow_map(data):
+    print("🗺️ Generating network flow map...")
     G = nx.DiGraph()
     for record in data:
         src = f"{record['SourceIP']} ({record['SourceInstance']})" if record['SourceInstance'] else record['SourceIP']
@@ -157,14 +176,17 @@ def generate_flow_map(data):
 
 
 def main():
-    print("🔍 Collecting AWS Network Info...")
+    print("🚀 Starting AWS Network Flow Analyzer...")
     instances = get_instances()
     ip_map = map_ip_to_instance(instances)
     flows = get_flow_logs()
     flow_data = parse_flow_logs(flows, ip_map)
 
-    export_csv(flow_data)
-    generate_flow_map(flow_data)
+    if flow_data:
+        export_csv(flow_data)
+        generate_flow_map(flow_data)
+    else:
+        print("⚠️ No flow data was parsed. No CSV or diagram will be created.")
 
 
 if __name__ == "__main__":
