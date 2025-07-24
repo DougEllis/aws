@@ -1,0 +1,128 @@
+import boto3
+from diagrams import Diagram, Cluster
+from diagrams.aws.compute import EC2
+from diagrams.aws.network import VPC, PublicSubnet, PrivateSubnet, InternetGateway, NATGateway, ELB, RouteTable
+from diagrams.aws.database import RDS
+from diagrams.aws.security import SecurityGroup
+from openpyxl import Workbook
+
+# AWS session
+session = boto3.Session(profile_name='default', region_name='us-east-1')
+ec2 = session.client('ec2')
+rds = session.client('rds')
+elb = session.client('elbv2')
+
+# Get data
+vpcs = ec2.describe_vpcs()['Vpcs']
+subnets = ec2.describe_subnets()['Subnets']
+instances = ec2.describe_instances()['Reservations']
+sgs = ec2.describe_security_groups()['SecurityGroups']
+nat_gateways = ec2.describe_nat_gateways()['NatGateways']
+elbs = elb.describe_load_balancers()['LoadBalancers']
+rds_instances = rds.describe_db_instances()['DBInstances']
+route_tables = ec2.describe_route_tables()['RouteTables']
+
+# Build SG and subnet maps
+sg_map = {sg['GroupId']: sg['GroupName'] for sg in sgs}
+subnet_map = {s['SubnetId']: s for s in subnets}
+
+# Excel workbook
+wb = Workbook()
+ws_ec2 = wb.create_sheet("EC2 Instances")
+ws_sg = wb.create_sheet("Security Groups")
+ws_subnet = wb.create_sheet("Subnets")
+ws_rds = wb.create_sheet("RDS")
+ws_elb = wb.create_sheet("ELBs")
+ws_nat = wb.create_sheet("NAT Gateways")
+ws_routes = wb.create_sheet("Route Tables")
+
+# Write headers
+ws_ec2.append(["InstanceId", "SubnetId", "VPC", "SecurityGroups"])
+ws_sg.append(["GroupId", "GroupName", "Description"])
+ws_subnet.append(["SubnetId", "CIDR", "VPC", "AZ"])
+ws_rds.append(["DB Identifier", "Engine", "VPC"])
+ws_elb.append(["ELB Name", "DNS Name", "VPC", "Type"])
+ws_nat.append(["NAT Gateway ID", "SubnetId", "VPC"])
+ws_routes.append(["Route Table ID", "VPC", "Associated Subnets"])
+
+# Diagram
+with Diagram("AWS Network with Route Tables", filename="aws_network_diagram", outformat="svg", show=True):
+    for vpc in vpcs:
+        vpc_id = vpc['VpcId']
+        with Cluster(f"VPC: {vpc_id}"):
+            igw = InternetGateway("IGW")
+            subnet_nodes = {}
+
+            for subnet in filter(lambda x: x['VpcId'] == vpc_id, subnets):
+                subnet_id = subnet['SubnetId']
+                is_public = subnet.get('MapPublicIpOnLaunch', False)
+                subnet_name = f"{subnet_id} ({'Public' if is_public else 'Private'})"
+                node = PublicSubnet(subnet_name) if is_public else PrivateSubnet(subnet_name)
+                subnet_nodes[subnet_id] = node
+                ws_subnet.append([subnet_id, subnet['CidrBlock'], vpc_id, subnet['AvailabilityZone']])
+
+            # Route Tables
+            for rt in route_tables:
+                if rt['VpcId'] != vpc_id:
+                    continue
+                rt_id = rt['RouteTableId']
+                rt_node = RouteTable(rt_id)
+                associated_subnets = []
+                for assoc in rt.get('Associations', []):
+                    subnet_id = assoc.get('SubnetId')
+                    if subnet_id and subnet_id in subnet_nodes:
+                        subnet_nodes[subnet_id] >> rt_node
+                        associated_subnets.append(subnet_id)
+                ws_routes.append([rt_id, vpc_id, ", ".join(associated_subnets)])
+
+            # NAT Gateway
+            for nat in filter(lambda x: x['VpcId'] == vpc_id, nat_gateways):
+                nat_id = nat['NatGatewayId']
+                nat_node = NATGateway(nat_id)
+                ws_nat.append([nat_id, nat['SubnetId'], nat['VpcId']])
+                if nat['SubnetId'] in subnet_nodes:
+                    subnet_nodes[nat['SubnetId']] >> nat_node
+
+            # ELBs
+            for lb in filter(lambda x: x['VpcId'] == vpc_id, elbs):
+                lb_node = ELB(lb['LoadBalancerName'])
+                ws_elb.append([lb['LoadBalancerName'], lb['DNSName'], lb['VpcId'], lb['Type']])
+                for az in lb['AvailabilityZones']:
+                    sid = az['SubnetId']
+                    if sid in subnet_nodes:
+                        subnet_nodes[sid] >> lb_node
+
+            # RDS
+            for db in rds_instances:
+                if db['DBSubnetGroup']['VpcId'] != vpc_id:
+                    continue
+                rds_node = RDS(db['DBInstanceIdentifier'])
+                ws_rds.append([db['DBInstanceIdentifier'], db['Engine'], vpc_id])
+                for subnet in db['DBSubnetGroup']['Subnets']:
+                    sid = subnet['SubnetIdentifier']
+                    if sid in subnet_nodes:
+                        subnet_nodes[sid] >> rds_node
+
+            # EC2
+            for res in instances:
+                for inst in res['Instances']:
+                    if inst['VpcId'] != vpc_id:
+                        continue
+                    inst_id = inst['InstanceId']
+                    subnet_id = inst.get('SubnetId')
+                    node = EC2(inst_id)
+                    if subnet_id in subnet_nodes:
+                        subnet_nodes[subnet_id] >> node
+
+                    sg_names = [sg_map.get(sg['GroupId'], sg['GroupId']) for sg in inst.get('SecurityGroups', [])]
+                    ws_ec2.append([inst_id, subnet_id, vpc_id, ", ".join(sg_names)])
+
+# Security Groups
+for sg in sgs:
+    ws_sg.append([sg['GroupId'], sg['GroupName'], sg['Description']])
+
+# Save Excel
+wb.remove(wb['Sheet'])  # remove default
+wb.save("aws_network_inventory.xlsx")
+print("✅ Diagram saved as aws_network_diagram.svg")
+print("✅ Excel saved as aws_network_inventory.xlsx")
