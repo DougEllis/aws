@@ -1,112 +1,171 @@
 import boto3
-import json
-import csv
 import ipaddress
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+import time
+from botocore.exceptions import ClientError
 
 REGION = "ap-southeast-2"
 
 # AWS Clients
-ec2 = boto3.client('ec2', region_name=REGION)
-logs = boto3.client('logs', region_name=REGION)
+session = boto3.Session(region_name=REGION)
+ec2 = session.client('ec2')
+logs = session.client('logs')
+
 
 def classify_ip(ip):
     try:
         ip_obj = ipaddress.ip_address(ip)
-        return 'External' if ip_obj.is_global else 'Internal'
+        if ip_obj.is_private:
+            return 'Internal'
+        elif ip_obj.is_global:
+            return 'External'
+        else:
+            return 'Unknown'
     except ValueError:
         return 'Unknown'
+
 
 def get_instances():
     instances = ec2.describe_instances()
     data = []
     for res in instances['Reservations']:
         for inst in res['Instances']:
-            interfaces = [ni['NetworkInterfaceId'] for ni in inst.get('NetworkInterfaces', [])]
+            private_ip = inst.get('PrivateIpAddress')
             data.append({
                 'InstanceId': inst['InstanceId'],
-                'PrivateIP': inst.get('PrivateIpAddress'),
+                'PrivateIP': private_ip,
                 'PublicIP': inst.get('PublicIpAddress'),
-                'NetworkInterfaces': interfaces,
-                'SecurityGroups': [sg['GroupId'] for sg in inst['SecurityGroups']]
+                'NetworkInterfaces': [ni['NetworkInterfaceId'] for ni in inst.get('NetworkInterfaces', [])],
+                'SecurityGroups': [sg['GroupId'] for sg in inst['SecurityGroups']],
             })
     return data
+
+
+def map_ip_to_instance(instances):
+    ip_map = {}
+    for inst in instances:
+        if inst['PrivateIP']:
+            ip_map[inst['PrivateIP']] = inst['InstanceId']
+        if inst['PublicIP']:
+            ip_map[inst['PublicIP']] = inst['InstanceId']
+    return ip_map
+
 
 def get_flow_logs():
     flow_logs = ec2.describe_flow_logs()
     return flow_logs['FlowLogs']
 
-def get_sample_flow_events(log_group):
-    streams = logs.describe_log_streams(logGroupName=log_group)['logStreams']
+
+def get_sample_flow_events(log_group, max_streams=2, max_events=100):
     events = []
-    for stream in streams[:1]:  # Limit for example
-        log_events = logs.get_log_events(logGroupName=log_group, logStreamName=stream['logStreamName'], limit=50)
-        for event in log_events['events']:
-            events.append(event['message'])
+    try:
+        streams = logs.describe_log_streams(logGroupName=log_group)['logStreams']
+        for stream in streams[:max_streams]:
+            attempts = 0
+            while attempts < 3:
+                try:
+                    log_events = logs.get_log_events(
+                        logGroupName=log_group,
+                        logStreamName=stream['logStreamName'],
+                        limit=max_events
+                    )
+                    for event in log_events['events']:
+                        events.append(event['message'])
+                    break
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'ThrottlingException':
+                        attempts += 1
+                        time.sleep(2 ** attempts)
+                    else:
+                        raise e
+    except ClientError as e:
+        print(f"❌ Failed to get logs from {log_group}: {e}")
     return events
 
-def parse_flow_logs(flow_logs):
+
+def parse_flow_logs(flow_logs, ip_instance_map):
     records = []
     for flow in flow_logs:
         log_group = flow['LogGroupName']
-        try:
-            events = get_sample_flow_events(log_group)
-            for message in events:
-                parts = message.split()
-                src_ip, dst_ip = parts[3], parts[4]
-                src_port, dst_port = parts[5], parts[6]
-                direction = 'Outbound' if classify_ip(dst_ip) == 'External' else 'Inbound'
-                records.append({
-                    'SourceIP': src_ip,
-                    'DestinationIP': dst_ip,
-                    'SourcePort': src_port,
-                    'DestinationPort': dst_port,
-                    'Direction': direction
-                })
-        except Exception as e:
-            print(f"Log group fetch failed: {log_group}, error: {e}")
+        events = get_sample_flow_events(log_group)
+        for message in events:
+            parts = message.split()
+            if len(parts) < 14:
+                continue  # Skip malformed logs
+
+            src_ip, dst_ip = parts[3], parts[4]
+            src_port, dst_port = parts[5], parts[6]
+
+            src_type = classify_ip(src_ip)
+            dst_type = classify_ip(dst_ip)
+
+            if src_type == 'Internal' and dst_type == 'Internal':
+                direction = 'Internal'
+            elif src_type == 'Internal' and dst_type == 'External':
+                direction = 'Outbound'
+            elif src_type == 'External' and dst_type == 'Internal':
+                direction = 'Inbound'
+            else:
+                direction = 'Unknown'
+
+            records.append({
+                'SourceIP': src_ip,
+                'DestinationIP': dst_ip,
+                'SourcePort': src_port,
+                'DestinationPort': dst_port,
+                'Direction': direction,
+                'SourceInstance': ip_instance_map.get(src_ip, ''),
+                'DestinationInstance': ip_instance_map.get(dst_ip, '')
+            })
     return records
+
 
 def export_csv(data, filename='aws_network_flows.csv'):
     df = pd.DataFrame(data)
     df.to_csv(filename, index=False)
     print(f"✅ CSV export complete: {filename}")
 
+
 def generate_flow_map(data):
     G = nx.DiGraph()
     for record in data:
-        src = record['SourceIP']
-        dst = record['DestinationIP']
-        direction = record['Direction']
+        src = f"{record['SourceIP']} ({record['SourceInstance']})" if record['SourceInstance'] else record['SourceIP']
+        dst = f"{record['DestinationIP']} ({record['DestinationInstance']})" if record['DestinationInstance'] else record['DestinationIP']
         label = f"{record['SourcePort']}→{record['DestinationPort']}"
-        color = 'blue' if direction == 'Internal' else 'red'
+        direction = record['Direction']
+        color = 'blue' if direction == 'Internal' else 'red' if direction == 'Outbound' else 'green'
+
         G.add_edge(src, dst, label=label, color=color)
 
     pos = nx.spring_layout(G, seed=42)
     edges = G.edges()
-    colors = [G[u][v]['color'] for u,v in edges]
+    colors = [G[u][v]['color'] for u, v in edges]
     labels = nx.get_edge_attributes(G, 'label')
 
-    plt.figure(figsize=(12, 8))
-    nx.draw(G, pos, edges=edges, edge_color=colors, with_labels=True, node_color='lightgray', node_size=800)
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, font_size=8)
-    plt.title("AWS Network Flow Map")
+    plt.figure(figsize=(14, 10))
+    nx.draw(G, pos, edges=edges, edge_color=colors, with_labels=True,
+            node_color='lightgray', node_size=1000, font_size=9)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, font_size=7)
+    plt.title("AWS Network Flow Map", fontsize=14)
     plt.axis('off')
     plt.tight_layout()
     plt.savefig("aws_network_flow_map.png")
     plt.show()
     print("🗺️ Visual flow map saved: aws_network_flow_map.png")
 
+
 def main():
     print("🔍 Collecting AWS Network Info...")
     instances = get_instances()
+    ip_map = map_ip_to_instance(instances)
     flows = get_flow_logs()
-    flow_data = parse_flow_logs(flows)
+    flow_data = parse_flow_logs(flows, ip_map)
 
     export_csv(flow_data)
     generate_flow_map(flow_data)
+
 
 if __name__ == "__main__":
     main()
